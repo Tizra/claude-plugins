@@ -1,0 +1,232 @@
+"""HTTP client for the Tizra admin REST API."""
+
+import ssl
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+import truststore
+
+
+class TizraError(Exception):
+    """An error response from the Tizra API, normalized to status, message and detail."""
+
+    def __init__(self, status: int, message: str, detail: Any = None):
+        super().__init__(f"{status}: {message}")
+        self.status = status
+        self.message = message
+        self.detail = detail
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": self.status, "message": self.message, "detail": self.detail}
+
+
+class TizraAuthError(TizraError):
+    """The API rejected the token: it redirected to the login page."""
+
+
+class TizraClient:
+    """Thin wrapper over the admin REST API; one method per endpoint."""
+
+    def __init__(self, base_url: str, site: str, auth_token: str, timeout: float = 30.0):
+        if httpx.URL(base_url).scheme != "https":
+            raise ValueError(
+                f"Tizra base URL must use https, not {base_url!r}: "
+                "the server ignores the API token on insecure requests."
+            )
+        self.base_url = base_url.rstrip("/")
+        self.site = site
+        self._http = httpx.Client(
+            base_url=self.base_url,
+            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+            headers={"tizra-authentication-token": auth_token, "accept": "application/json"},
+            timeout=timeout,
+        )
+
+    def check_auth(self) -> None:
+        """Make one cheap authenticated request; raises TizraAuthError if the token is rejected."""
+        self._request("GET", self.admin_path("types", "AdminTagged"))
+
+    def admin_path(self, *segments: str) -> str:
+        """Build an `/admin-api/{site}/...` path, escaping each segment."""
+        return "/".join(quote(s, safe="") for s in ["", "admin-api", self.site, *segments])
+
+    def list_types(self, include_props: bool = False) -> Any:
+        params = {"table": "true", **({"settable": "true"} if include_props else {})}
+        return self._request("GET", self.admin_path("types"), params=params)
+
+    def get_type(self, type_name: str) -> Any:
+        path = self.admin_path("types", type_name)
+        return self._request("GET", path, params={"settable": "true"})
+
+    def list_prop_defs(self, type_name: str, include_inherited: bool = False) -> Any:
+        listing = "all-prop-defs" if include_inherited else "prop-defs"
+        return self._request("GET", self.admin_path("types", type_name, listing))
+
+    def effective_prop_defs(self, type_name: str) -> list[dict[str, Any]]:
+        """A type's complete prop-defs, each labeled with the nearest type that declares it.
+
+        Definitions come from the type itself (source "local"), its chain of site super-types
+        ("super-type"), and defaults from its chain of system base-types ("base-type"). Each
+        record from all-prop-defs gets `declared-by: {type, source}`, or None when neither
+        chain declares it.
+        """
+        defs = self._request("GET", self.admin_path("types", type_name, "all-prop-defs"))
+        declared_by: dict[str, dict[str, str]] = {}
+
+        def claim(record: dict[str, Any], source: str) -> None:
+            # A type record lists its local prop-defs as a map of name to URL.
+            for prop in record.get("prop-defs") or {}:
+                declared_by.setdefault(prop, {"type": record["name"], "source": source})
+
+        record = self._request("GET", self.admin_path("types", type_name))
+        base = record.get("base-type")
+        source, seen = "local", set()
+        while record and record["name"] not in seen:
+            seen.add(record["name"])
+            claim(record, source)
+            parent = record.get("super-type")
+            record = parent and self._request("GET", self.admin_path("types", parent))
+            source = "super-type"
+        # A system type's base-type is its parent: system Book -> Title -> AdminTagged.
+        seen = set()
+        while base and base not in seen:
+            seen.add(base)
+            record = self._request("GET", self.admin_path("system-types", base))
+            claim(record, "base-type")
+            base = record.get("base-type")
+        return [{**d, "declared-by": declared_by.get(d.get("name"))} for d in defs]
+
+    def upsert_prop_def(self, type_name: str, prop_name: str, attributes: dict[str, Any]) -> Any:
+        path = self.admin_path("types", type_name, "prop-defs", prop_name)
+        return self._request("POST", path, json=attributes)
+
+    def remove_prop_def(self, type_name: str, prop_name: str) -> Any:
+        return self._request("DELETE", self.admin_path("types", type_name, "prop-defs", prop_name))
+
+    def query_objects(
+        self,
+        meta_type: str,
+        parsed_props: list[str] | None = None,
+        match: list[dict[str, str]] | None = None,
+        start: int = 0,
+        limit: int = 20,
+        sort_prop: str | None = None,
+        descending: bool = False,
+        fields: list[str] | None = None,
+    ) -> Any:
+        params: list[tuple[str, str | int]] = [
+            ("meta-type", meta_type), ("start", start), ("limit", limit)
+        ]
+        params += _selection(parsed_props, fields)
+        for m in match or []:
+            params += [("match-prop", m["prop"]), ("match-value", m["value"])]
+        if sort_prop:
+            params += [("sort-prop", sort_prop), ("descending", str(descending).lower())]
+        # The trailing slash matters: "query" without it is the single-object route.
+        listing = "match" if match else ""
+        return self._request("GET", self.admin_path("query", listing), params=params)
+
+    def get_object(
+        self, tizra_id: str, parsed_props: list[str] | None = None, fields: list[str] | None = None
+    ) -> Any:
+        path = self.admin_path("objects", tizra_id)
+        return self._request("GET", path, params=_selection(parsed_props, fields))
+
+    def update_object_props(self, tizra_id: str, props: dict[str, Any]) -> Any:
+        return self._request("PUT", self.admin_path("objects", tizra_id), json={"props": props})
+
+    def create_object(self, meta_type: str, props: dict[str, Any]) -> Any:
+        body = {"operation": "update-add", "data": {"meta-type": meta_type, "props": props}}
+        return self._request("POST", self.admin_path("objects"), json=body)
+
+    def delete_object(self, tizra_id: str) -> Any:
+        return self._request("DELETE", self.admin_path("objects", tizra_id))
+
+    def publish_object(self, tizra_id: str, operation: str) -> Any:
+        path = self.admin_path("objects", tizra_id)
+        if operation not in ("live", "staging", "unpublish"):
+            raise ValueError("operation must be live, staging, or unpublish")
+        return self._request("POST", path, json={"operation": operation})
+
+    def search_objects(
+        self,
+        all: list[str] | None = None,
+        any: list[str] | None = None,
+        excluded: list[str] | None = None,
+        meta_type: str | None = None,
+        parsed_props: list[str] | None = None,
+        start: int = 0,
+        limit: int = 20,
+        fields: list[str] | None = None,
+    ) -> Any:
+        if not (all or any or excluded):
+            raise ValueError("search_objects needs at least one of all, any or excluded")
+        # check-syntax makes the server reject malformed terms instead of silently dropping them.
+        params: list[tuple[str, str | int]] = [
+            ("check-syntax", "true"), ("start", start), ("limit", limit)
+        ]
+        params += [("all", t) for t in all or []]
+        params += [("any", t) for t in any or []]
+        params += [("excluded", t) for t in excluded or []]
+        params += _selection(parsed_props, fields)
+        if meta_type:
+            params.append(("meta-type", meta_type))
+        return self._request("GET", self.admin_path("query", "search"), params=params)
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Make a request and return its parsed body, raising TizraError on failure."""
+        try:
+            response = self._http.request(method, path, **kwargs)
+        except httpx.HTTPError as e:
+            raise TizraError(0, f"request failed: {e}") from e
+        if response.is_redirect:
+            # Never follow: a rejected token redirects to the login page, and a public host
+            # redirects to the site's admin host. Either way the configuration is wrong.
+            location = response.headers.get("location") or ""
+            detail = {"location": location}
+            if "/login" in location:
+                message = "not authenticated: the API token does not match the site's APIToken"
+                raise TizraAuthError(response.status_code, message, detail)
+            message = (
+                f"redirected to {location}; set the base URL to the site's admin host "
+                "(the forget_credentials tool lets the user enter it again)"
+            )
+            raise TizraError(response.status_code, message, detail)
+        if response.is_error:
+            raise _normalize_error(response)
+        if not response.content:
+            # Object updates answer with an empty body and the object's Location header.
+            return {"status": response.status_code, "location": response.headers.get("location")}
+        try:
+            return response.json()
+        except ValueError:
+            return response.text
+
+
+def _normalize_error(response: httpx.Response) -> TizraError:
+    """The API returns varying error shapes: a JSON map, a JSON string, or plain text."""
+    status = response.status_code
+    message = response.reason_phrase
+    detail: Any = None
+    try:
+        body = response.json()
+    except ValueError:
+        body = response.text.strip() or None
+    if isinstance(body, dict):
+        message = str(body.get("message") or body.get("error") or message)
+        detail = body.get("detail") or body.get("details") or {
+            k: v for k, v in body.items() if k not in ("message", "error", "status")
+        } or None
+    elif body is not None:
+        message = str(body)
+    return TizraError(status, message, detail)
+
+
+def _selection(parsed_props: list[str] | None, fields: list[str] | None) -> list[tuple[str, str]]:
+    """Query params selecting properties (as parsed-props) and top-level record fields.
+
+    The raw `props` selection param is deliberately not offered: the API ignores it whenever
+    `parsed-props` is given, and parsed-props also narrows the record's `props`.
+    """
+    return [("parsed-props", p) for p in parsed_props or []] + [("fields", f) for f in fields or []]

@@ -1,0 +1,8 @@
+{
+  "name": "tizra-admin",
+  "version": "0.1.0",
+  "description": "Read and modify Tizra content and meta-types through the admin API",
+  "author": {
+    "name": "Tizra"
+  }
+}
