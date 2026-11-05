@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "tizra-admin": {
+      "command": "uv",
+      "args": ["run", "--quiet", "--directory", "${CLAUDE_PLUGIN_ROOT}", "tizra-admin-mcp"],
+      "env": {
+        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv",
+        "TIZRA_BASE_URL": "${TIZRA_BASE_URL:-}",
+        "TIZRA_SITE": "${TIZRA_SITE:-_}",
+        "TIZRA_AUTH_TOKEN": "${TIZRA_AUTH_TOKEN:-}"
+      }
+    }
+  }
+}
