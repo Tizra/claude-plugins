@@ -22,7 +22,7 @@ the marketplace in `/plugin`.
 
 | Variable           | Value                                                                 |
 |--------------------|-----------------------------------------------------------------------|
-| `TIZRA_BASE_URL`   | The site's **admin host**, over **https**                             |
+| `TIZRA_BASE_URL`   | The site's URL, over **https**; its public or admin host              |
 | `TIZRA_SITE`       | The `{site}` path segment; normally `_`, the default                  |
 | `TIZRA_AUTH_TOKEN` | The site's API token                                                  |
 
@@ -36,10 +36,11 @@ same call (cancel to stop); a second rejection forgets it, so the next call asks
 sites, or to re-enter a base URL, ask Claude to run `forget_credentials`: it drops the base URL
 and token, including ones from environment variables, and the next call asks for both.
 
-Three things that look like configuration errors and are:
+Three things to know about the configuration:
 
-- **Use the admin host.** A site's public host redirects admin requests to its admin host. The
-  client does not follow redirects; it reports the redirect target so you can fix the URL.
+- **The admin host is found for you.** A site's public host redirects admin requests to its admin
+  host, and the server follows that redirect (without sending the token) to find it. If that
+  fails, the client reports where the API redirected so you can enter the admin host instead.
 - **Use https.** The server only honors the token on secure requests, so the client rejects an
   `http://` base URL rather than failing later with a redirect to the login page.
 - **A wrong token redirects to the login page.** The client reports that as "not authenticated"

@@ -25,20 +25,63 @@ class TizraAuthError(TizraError):
     """The API rejected the token: it redirected to the login page."""
 
 
+ADMIN_MAIN = "/admin/main"
+"""The admin's front page; a site's public host redirects it to the site's admin host."""
+
+MAX_ADMIN_HOPS = 5
+
+
+def _require_https(base_url: str) -> None:
+    if httpx.URL(base_url).scheme != "https":
+        raise ValueError(
+            f"Tizra base URL must use https, not {base_url!r}: "
+            "the server ignores the API token on insecure requests."
+        )
+
+
+def _verify() -> ssl.SSLContext:
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def find_admin_base_url(base_url: str, timeout: float = 30.0) -> str:
+    """Return the base URL of the site's admin host, given the site's public or admin host.
+
+    Follows the redirects of `/admin/main` while they stay on that path: a public host sends it
+    to the admin host, possibly by way of another host such as www to the bare domain. The
+    first redirect elsewhere, normally to the login page, means the admin host has been
+    reached. Sends no token. Returns base_url unchanged when the redirects lead nowhere useful
+    or the host cannot be reached; the API request that follows reports the problem.
+    """
+    _require_https(base_url)
+    url = httpx.URL(base_url).copy_with(path=ADMIN_MAIN, query=None, fragment=None)
+    try:
+        with httpx.Client(verify=_verify(), timeout=timeout) as http:
+            for _ in range(MAX_ADMIN_HOPS):
+                response = http.get(url)
+                location = response.headers.get("location")
+                if not response.is_redirect or not location:
+                    break
+                target = url.join(location)
+                if target.path != ADMIN_MAIN:
+                    break
+                url = target
+    except httpx.HTTPError:
+        return base_url
+    if url.scheme != "https" or url.host == httpx.URL(base_url).host:
+        return base_url
+    return str(url.copy_with(path="/", query=None, fragment=None)).rstrip("/")
+
+
 class TizraClient:
     """Thin wrapper over the admin REST API; one method per endpoint."""
 
     def __init__(self, base_url: str, site: str, auth_token: str, timeout: float = 30.0):
-        if httpx.URL(base_url).scheme != "https":
-            raise ValueError(
-                f"Tizra base URL must use https, not {base_url!r}: "
-                "the server ignores the API token on insecure requests."
-            )
+        _require_https(base_url)
         self.base_url = base_url.rstrip("/")
         self.site = site
         self._http = httpx.Client(
             base_url=self.base_url,
-            verify=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+            verify=_verify(),
             headers={"tizra-authentication-token": auth_token, "accept": "application/json"},
             timeout=timeout,
         )

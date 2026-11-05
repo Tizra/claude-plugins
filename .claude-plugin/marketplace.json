@@ -8,7 +8,7 @@
     {
       "name": "tizra-admin",
       "description": "Read and modify Tizra content and meta-types through the admin API",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": "./plugins/tizra-admin"
     }
   ]

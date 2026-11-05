@@ -23,7 +23,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.resolve import Elicit, Resolve
 from pydantic import BaseModel, Field, create_model
 
-from tizra_client import TizraAuthError, TizraClient, TizraError
+from tizra_client import TizraAuthError, TizraClient, TizraError, find_admin_base_url
 
 T = TypeVar("T")
 
@@ -33,7 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 CONFIG_VARS = {
     "base_url": (
         "TIZRA_BASE_URL",
-        "Site admin host, e.g. https://s10069-admin.dev11.agilepublisher.com",
+        "The site's URL, e.g. https://www.example.com; its admin host is found from it",
     ),
     "site": ("TIZRA_SITE", "Site segment of /admin-api/{site}/ (normally _)"),
     "auth_token": ("TIZRA_AUTH_TOKEN", "The site's APIToken site parameter"),
@@ -108,6 +108,8 @@ def get_client(
             f"Tizra configuration is missing; set {names} in the MCP server environment."
         )
     try:
+        # A public host only redirects the API to the admin host, so move to it up front.
+        _config["base_url"] = find_admin_base_url(_config["base_url"])
         return TizraClient(_config["base_url"], _config["site"], _config["auth_token"])
     except ValueError as e:
         # Forget the rejected base URL so the next call asks again.
