@@ -1,7 +1,10 @@
 """MCP server exposing the Tizra admin API to Claude Code over stdio.
 
-Configuration comes from TIZRA_BASE_URL and TIZRA_AUTH_TOKEN. Any that are missing are requested
-from the user through MCP elicitation on the first tool call that needs the API.
+Sites and their tokens come from the user's credentials file (site_credentials), chosen with
+select_credentials, or from TIZRA_BASE_URL and TIZRA_AUTH_TOKEN, which pin the session to one site.
+Only a pinned session elicits missing values implicitly, on the first tool call that needs the
+API: some clients advertise elicitation and never deliver the answers, so elsewhere it is asked
+for only through enter_credentials, by name. The README's Configuration section has the details.
 Never read stdin or prompt on stderr here: under stdio transport stdin carries the protocol.
 """
 
@@ -15,6 +18,7 @@ import re
 import threading
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypeVar
 
 from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
@@ -23,6 +27,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.resolve import Elicit, Resolve
 from pydantic import BaseModel, Field, create_model
 
+import site_credentials
 from tizra_client import TizraAuthError, TizraClient, TizraError, find_admin_base_url
 
 T = TypeVar("T")
@@ -48,6 +53,13 @@ _config: dict[str, str] = {
     for key, (var, _) in CONFIG_VARS.items()
     if (value := os.environ.get(var, "").strip())
 }
+_pinned = bool(_config)
+"""Whether environment variables bind the session to one site; see the README's modes.
+
+Pinned, missing values are elicited implicitly, as the protocol intends. Otherwise credentials
+come only from select_credentials or enter_credentials, since a client that advertises
+elicitation may still ignore the answers, leaving an implicit prompt to hang the call.
+"""
 _client: TizraClient | None = None
 """The session's client, once the API has accepted its token."""
 
@@ -58,14 +70,59 @@ A check of the configuration and the write it justifies happen in one hold. Neve
 a request or a prompt: a call waiting on either must not stall the others.
 """
 
+NO_SITE = (
+    "No Tizra site is selected. Call list_sites to see the sites in the user's credentials file, "
+    "then select_credentials with one of them; as a last resort, enter_credentials asks the "
+    "user to type a site and its token."
+)
+
 REJECTED_TOKEN = (
     "not authenticated: the site rejected the API token, so it has been forgotten; "
     "the next call will ask for it again"
 )
 
+REJECTED_SELECTED_TOKEN = (
+    "not authenticated: the site rejected the API token, so it has been forgotten and no site "
+    "is selected; once the token is corrected in the credentials file, call select_credentials "
+    "again, or use enter_credentials"
+)
+
+
+def _refuse_if_pinned() -> None:
+    """Refuse to change a pinned session's site: nothing the model reads may move it."""
+    if _pinned:
+        with _lock:
+            url = _config.get("base_url") or os.environ.get("TIZRA_BASE_URL", "").strip()
+        site = url or "the site its environment variables configure"
+        raise ToolError(
+            f"This session is pinned to {site} by the TIZRA_BASE_URL and TIZRA_AUTH_TOKEN "
+            "environment variables, so its site cannot be changed. To work with other sites, "
+            "start the MCP server without them and use the credentials file."
+        )
+
 
 def _missing() -> list[str]:
     return [key for key in CONFIG_VARS if key not in _config]
+
+
+def _token_from_file() -> None:
+    """In a pinned session with a base URL and no token, take the token from the credentials file.
+
+    Looked up under the host the environment names, as given rather than as the admin host it
+    may since have become. A missing or unusable file, or no entry, leaves elicitation to ask.
+    """
+    with _lock:
+        if not _pinned or "auth_token" in _config or "base_url" not in _config:
+            return
+        url = os.environ.get("TIZRA_BASE_URL", "").strip() or _config["base_url"]
+    try:
+        found = site_credentials.match(url, site_credentials.load().entries)
+    except ValueError:
+        return
+    if found is not None:
+        with _lock:
+            if "base_url" in _config:
+                _config.setdefault("auth_token", found[1])
 
 
 def _can_elicit(ctx: Context) -> bool:
@@ -80,8 +137,9 @@ def ask_config(ctx: Context) -> Elicit[BaseModel] | None:
     A resolver rather than a direct ctx.elicit() call, so the SDK can elicit over either
     protocol: InputRequiredResult on >= 2026-07-28, a mid-call request on older ones.
     """
+    _token_from_file()
     missing = _missing()
-    if _client is not None or not missing or not _can_elicit(ctx):
+    if not _pinned or _client is not None or not missing or not _can_elicit(ctx):
         return None
     fields: dict[str, Any] = {key: (str, Field(description=CONFIG_VARS[key][1])) for key in missing}
     names = ", ".join(CONFIG_VARS[key][0] for key in missing)
@@ -102,6 +160,7 @@ def get_client(
     """
     if (client := _client) is not None:
         return client
+    _token_from_file()
     with _lock:
         missing = _missing()
         # When ask_config declines to ask, answer arrives as accepted with data None.
@@ -110,6 +169,8 @@ def get_client(
             _config.update({key: value for key, value in values.items() if value})
             missing = _missing()
         config = dict(_config)
+    if missing and not _pinned:
+        raise ToolError(NO_SITE)
     if missing:
         names = ", ".join(CONFIG_VARS[key][0] for key in missing)
         raise ToolError(
@@ -152,7 +213,7 @@ def ask_token_again(
     client: Annotated[TizraClient, Resolve(get_client)], ctx: Context
 ) -> Elicit[TokenAgain] | None:
     """Ask for the token again when the API rejects a new client's token."""
-    if client is _client or _accepts(client) or not _can_elicit(ctx):
+    if not _pinned or client is _client or _accepts(client) or not _can_elicit(ctx):
         return None
     # Worded differently from ask_config: the SDK asks each distinct question once per call.
     return Elicit(
@@ -236,25 +297,219 @@ def _api(client: TizraClient, call: Callable[[], T]) -> T:
         return call()
     except TizraAuthError as e:
         _forget_token(client)
-        raise ToolError(json.dumps({**e.to_dict(), "message": REJECTED_TOKEN})) from e
+        message = REJECTED_TOKEN if _pinned else REJECTED_SELECTED_TOKEN
+        raise ToolError(json.dumps({**e.to_dict(), "message": message})) from e
     except TizraError as e:
         raise ToolError(json.dumps(e.to_dict())) from e
 
 
+LAST_RESORT = "As a last resort, enter_credentials asks the user to type a site and its token."
+
+
+def _load_sites() -> site_credentials.Sites:
+    try:
+        return site_credentials.load()
+    except site_credentials.CredentialsFileError as e:
+        raise ToolError(f"{e}\n\n{LAST_RESORT}") from e
+
+
+@mcp.tool()
+def list_sites() -> dict[str, Any]:
+    """List the Tizra sites the user has configured. Call this first when the user wants to
+    work with a Tizra site, then select_credentials with one of the hosts it returns.
+
+    The sites come from the user's credentials file; their API tokens are never shown. Also
+    reports the site in use, if any, entries that cannot be used and why, and whether the
+    session is pinned to one site by environment variables, in which case it cannot switch.
+    """
+    with _lock:
+        current = _client.base_url if _client is not None else None
+    if _pinned:
+        with _lock:
+            url = _config.get("base_url") or os.environ.get("TIZRA_BASE_URL", "").strip()
+        return {
+            "mode": "pinned",
+            "pinned_to": url or None,
+            "current_site": current,
+            "note": "This session is pinned by the TIZRA_BASE_URL and TIZRA_AUTH_TOKEN "
+            "environment variables; select_credentials and enter_credentials are unavailable.",
+        }
+    sites = _load_sites()
+    result: dict[str, Any] = {
+        "mode": "file",
+        "file": str(site_credentials.path()),
+        "sites": sorted(sites.entries),
+        "current_site": current,
+    }
+    if sites.invalid:
+        result["invalid"] = sites.invalid
+    if sites.warning:
+        result["warning"] = sites.warning
+    return result
+
+
+def _install(client: TizraClient, token: str) -> None:
+    """Make a client the API has accepted the session's, replacing whatever site was in use."""
+    global _client
+    with _lock:
+        _config["base_url"] = client.base_url
+        _config["auth_token"] = token
+        _client = client
+
+
+@mcp.tool()
+def select_credentials(name: str) -> dict[str, Any]:
+    """Use one of the Tizra sites in the user's credentials file for the rest of the session.
+
+    name is a host such as www.example.com, or a URL on it, matching a host list_sites returns;
+    a leading www. is added or removed if that is what matches. The token comes from the file,
+    and the site is checked to accept it before it replaces the site in use.
+    """
+    _refuse_if_pinned()
+    sites = _load_sites()
+    file = site_credentials.path()
+    try:
+        found = site_credentials.match(name, sites.entries)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    if found is None:
+        configured = ", ".join(sorted(sites.entries)) or "none"
+        raise ToolError(
+            f"No site in {file} matches {name!r}. Configured sites: {configured}. To use another "
+            f"site, the user can add it to that file. {LAST_RESORT}"
+        )
+    host, token = found
+    try:
+        base_url = find_admin_base_url(f"https://{host}")
+        client = TizraClient(base_url, token)
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+    if not _accepts(client):
+        raise ToolError(
+            f"{client.base_url} rejected the token for {host} in {file}; the user should "
+            f"correct it there, then call select_credentials again. {LAST_RESORT}"
+        )
+    _install(client, token)
+    result: dict[str, Any] = {"selected": host, "admin_site": client.base_url}
+    if sites.warning:
+        result["warning"] = sites.warning
+    return result
+
+
+def ask_entry(ctx: Context) -> Elicit[BaseModel] | None:
+    """Ask the user for a site and its token, for enter_credentials; never in a pinned session."""
+    if _pinned or not _can_elicit(ctx):
+        return None
+    fields: dict[str, Any] = {
+        key: (str, Field(description=description)) for key, (_, description) in CONFIG_VARS.items()
+    }
+    return Elicit(
+        "Enter the Tizra site to use and its API token. To skip this next time, list the site "
+        f"in {site_credentials.path()}.",
+        create_model("TizraSite", **fields),
+    )
+
+
+def _not_entered(why: str) -> ToolError:
+    return ToolError(f"{why} {site_credentials.format_help()} Then call select_credentials.")
+
+
+@dataclass(frozen=True)
+class Entered:
+    """A client for the site the user entered, its token not yet checked, and that token."""
+
+    client: TizraClient
+    token: str
+
+
+def entered_client(
+    answer: Annotated[
+        AcceptedElicitation[BaseModel] | DeclinedElicitation | CancelledElicitation | None,
+        Resolve(ask_entry),
+    ],
+) -> Entered | None:
+    """What the user entered for enter_credentials; None when pinned, which it refuses."""
+    if _pinned:
+        return None
+    # When ask_entry declines to ask, answer arrives as accepted with data None.
+    if isinstance(answer, AcceptedElicitation) and answer.data is None:
+        raise _not_entered("This client cannot ask the user for credentials (MCP elicitation).")
+    if not isinstance(answer, AcceptedElicitation):
+        raise _not_entered("No credentials were entered.")
+    values = {key: str(getattr(answer.data, key, "")).strip() for key in CONFIG_VARS}
+    if not all(values.values()):
+        raise _not_entered("Both the site and its token are needed.")
+    try:
+        base_url = find_admin_base_url(values["base_url"])
+        return Entered(TizraClient(base_url, values["auth_token"]), values["auth_token"])
+    except ValueError as e:
+        raise ToolError(str(e)) from e
+
+
+def ask_entered_token_again(
+    entered: Annotated[Entered | None, Resolve(entered_client)], ctx: Context
+) -> Elicit[TokenAgain] | None:
+    """Ask once more when the site rejects the token the user entered."""
+    if entered is None or _accepts(client := entered.client) or not _can_elicit(ctx):
+        return None
+    # Worded differently from ask_token_again: the SDK asks each distinct question once per call.
+    return Elicit(
+        f"{client.base_url} rejected the API token you entered. Enter it again, or cancel to "
+        "keep the current site.",
+        TokenAgain,
+    )
+
+
+@mcp.tool()
+def enter_credentials(
+    entered: Annotated[Entered | None, Resolve(entered_client)],
+    retry: Annotated[
+        AcceptedElicitation[TokenAgain] | DeclinedElicitation | CancelledElicitation | None,
+        Resolve(ask_entered_token_again),
+    ],
+) -> dict[str, Any]:
+    """Ask the user to type a Tizra site and its API token, and use that site.
+
+    A last resort: prefer list_sites and select_credentials. Some clients advertise that they
+    can ask the user and then never deliver the answer, so this may show no form, or never
+    complete; if so, the user should add the site to the credentials file instead. The values
+    come from the user and are never passed as arguments.
+    """
+    _refuse_if_pinned()
+    assert entered is not None  # Only None when pinned.
+    client, token = entered.client, entered.token
+    if not _accepts(client):
+        token = ""
+        if isinstance(retry, AcceptedElicitation) and retry.data is not None:
+            token = retry.data.auth_token.strip()
+        client = TizraClient(client.base_url, token) if token else client
+        if not token or not _accepts(client):
+            raise ToolError(
+                f"not authenticated: {client.base_url} rejected the token, so the site in use "
+                f"is unchanged. {site_credentials.format_help()}"
+            )
+    _install(client, token)
+    return {"selected": client.base_url}
+
+
 @mcp.tool()
 def forget_credentials() -> str:
-    """Forget the Tizra base URL and API token, including ones from environment variables.
+    """Forget the selected Tizra site and its API token, leaving no site selected.
 
-    The next call to a Tizra tool asks the user for both, so this is how to switch to another
-    site, or to re-enter a base URL that pointed at the wrong host. The user enters the new
-    values; they are never passed as arguments.
+    Afterwards Tizra tools fail until select_credentials or enter_credentials picks a site, so
+    this starts a session over. Switching sites needs no forgetting: select_credentials replaces
+    the current site. A session pinned to one site by environment variables cannot forget it.
     """
     global _client
+    _refuse_if_pinned()
     with _lock:
         _client = None
         _config.pop("base_url", None)
         _config.pop("auth_token", None)
-    return "Forgot the Tizra base URL and API token; the next call will ask the user for them."
+    return (
+        "Forgot the Tizra site and API token; no site is selected until select_credentials or "
+        "enter_credentials picks one."
+    )
 
 
 TYPE_SUMMARY_KEYS = ("name", "display-name", "base-type", "is-user-defined")

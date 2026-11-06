@@ -20,33 +20,77 @@ the marketplace in `/plugin`.
 
 ## Configuration
 
+The server needs each site's URL and API token. It gets them in one of two ways, decided when it
+starts: from a credentials file, which can list any number of sites, or from environment
+variables, which pin the session to one.
+
+### The credentials file
+
+List your sites in `~/.config/tizra/sites.toml`, one entry per host with that site's token:
+
+```toml
+[sites."www.example.com"]
+token = "the site's APIToken setting"
+
+[sites."books.example.org"]
+token = "..."
+```
+
+Then run `chmod 600 ~/.config/tizra/sites.toml`. If other users can read the file, the server
+says so in its tool results, but carries on using it. It reads the file afresh whenever it needs
+it, so edits take effect without a restart, and it never writes to it.
+
+Ask Claude to work with a site and it calls `list_sites`, which shows your hosts but never their
+tokens, then `select_credentials` with the site you named. A name matches a host exactly, or with
+a leading `www.` added or removed, and a URL on the host works too. The site is reached at
+`https://` followed by the host as written in the file. Its token is checked before the session
+switches to it, and a rejected token leaves the site in use unchanged. Until a site is selected,
+the other tools fail and say how to select one.
+
+Claude can switch among the sites in the file at any time. Content Claude reads on one site could
+therefore steer it to act on another. If you want a session locked to one site, use the
+environment variables instead.
+
+For a site that is not in the file, `enter_credentials` asks you to type its URL and token in
+Claude Code; they go straight to the server, never through the model. If the site rejects the
+token, you are asked for it once more (cancel to stop). Treat it as a last resort: see the note on
+the desktop application below. `forget_credentials` drops the selected site, leaving none.
+
+### Environment variables
+
 | Variable           | Value                                                                 |
 |--------------------|-----------------------------------------------------------------------|
 | `TIZRA_BASE_URL`   | The site's URL, over **https**; its public or admin host              |
 | `TIZRA_AUTH_TOKEN` | The site's API token                                                  |
 
-You can export them before starting Claude Code, but you don't have to: any that are unset are
-requested from you inside Claude Code on the first tool call, and kept for the session. Entered
-that way, the token goes straight to the server and never passes through the model. If your
+When either variable is set, the session is pinned to that site. `select_credentials`,
+`enter_credentials` and `forget_credentials` refuse, so nothing Claude reads can move the session
+to another site. With `TIZRA_BASE_URL` alone, the token is taken from the credentials file's entry
+for that host. Anything still missing is requested from you inside Claude Code on the first tool
+call, and kept for the session; entered that way, the token goes straight to the server. If your
 client cannot ask, the tool reports which variables to set.
 
-The token is checked before first use. If the site rejects it, you are asked for it again in the
-same call (cancel to stop); a second rejection forgets it, so the next call asks again. To switch
-sites, or to re-enter a base URL, ask Claude to run `forget_credentials`: it drops the base URL
-and token, including ones from environment variables, and the next call asks for both. A call
-still waiting for you to re-enter a token when that happens fails instead, without sending the
-token anywhere, since it was asked for the site you were leaving.
+In a pinned session, the token is checked before first use. If the site rejects it, you are asked
+for it again in the same call (cancel to stop), and a second rejection forgets it, so the next
+call asks again.
 
-Three things to know about the configuration:
+### The Claude desktop application
+
+The desktop application says it can ask you for input, but it never passes your answers back to
+the server, so a request for credentials there never completes. Use the credentials file. For
+the same reason, `delete_object`, which needs your confirmation, cannot delete anything there.
+
+### Hosts, https and tokens
+
+Three things to know whichever way a site is configured:
 
 - **The admin host is found for you.** A site's public host redirects admin requests to its admin
   host, and the server follows that redirect (without sending the token) to find it. If that
   fails, the client reports where the API redirected so you can enter the admin host instead.
 - **Use https.** The server only honors the token on secure requests, so the client rejects an
   `http://` base URL rather than failing later with a redirect to the login page.
-- **A wrong token redirects to the login page.** The client reports that as "not authenticated"
-  and asks for the token again. A token changed while a session is open is only noticed when the
-  server's session ends.
+- **A wrong token redirects to the login page.** The client reports that as "not authenticated".
+  A token changed while a session is open is only noticed when the server's session ends.
 
 TLS is verified against your operating system's trust store.
 
@@ -73,7 +117,10 @@ to the site through the API, so treat it like an administrator's password.
 | `delete_object`       | Delete an object, after you confirm its title and URL in Claude Code  |
 | `publish_object`      | `live`, `staging` or `unpublish`                                      |
 | `execute_code`        | Run Python with a `client` for batch work (no deletes)                |
-| `forget_credentials`  | Forget the base URL and token; the next call asks for them            |
+| `list_sites`          | The sites in your credentials file, and the one in use                |
+| `select_credentials`  | Use a site from the credentials file                                  |
+| `enter_credentials`   | Type a site and token into Claude Code; a last resort                 |
+| `forget_credentials`  | Drop the selected site; refused in a pinned session                   |
 
 The three object read tools return complete records unless narrowed. `parsed_props` names the
 properties to return and `fields` the top-level record fields; together they give the smallest
