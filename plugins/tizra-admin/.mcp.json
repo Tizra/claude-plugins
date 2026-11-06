@@ -6,7 +6,6 @@
       "env": {
         "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv",
         "TIZRA_BASE_URL": "${TIZRA_BASE_URL:-}",
-        "TIZRA_SITE": "${TIZRA_SITE:-_}",
         "TIZRA_AUTH_TOKEN": "${TIZRA_AUTH_TOKEN:-}"
       }
     }

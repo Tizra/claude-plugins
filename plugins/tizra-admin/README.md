@@ -23,7 +23,6 @@ the marketplace in `/plugin`.
 | Variable           | Value                                                                 |
 |--------------------|-----------------------------------------------------------------------|
 | `TIZRA_BASE_URL`   | The site's URL, over **https**; its public or admin host              |
-| `TIZRA_SITE`       | The `{site}` path segment; normally `_`, the default                  |
 | `TIZRA_AUTH_TOKEN` | The site's API token                                                  |
 
 You can export them before starting Claude Code, but you don't have to: any that are unset are
@@ -34,7 +33,9 @@ client cannot ask, the tool reports which variables to set.
 The token is checked before first use. If the site rejects it, you are asked for it again in the
 same call (cancel to stop); a second rejection forgets it, so the next call asks again. To switch
 sites, or to re-enter a base URL, ask Claude to run `forget_credentials`: it drops the base URL
-and token, including ones from environment variables, and the next call asks for both.
+and token, including ones from environment variables, and the next call asks for both. A call
+still waiting for you to re-enter a token when that happens fails instead, without sending the
+token anywhere, since it was asked for the site you were leaving.
 
 Three things to know about the configuration:
 

@@ -62,6 +62,8 @@ def find_admin_base_url(base_url: str, timeout: float = 30.0) -> str:
                 if not response.is_redirect or not location:
                     break
                 target = url.join(location)
+                if target.scheme != "https":
+                    return base_url
                 if target.path != ADMIN_MAIN:
                     break
                 url = target
@@ -75,10 +77,9 @@ def find_admin_base_url(base_url: str, timeout: float = 30.0) -> str:
 class TizraClient:
     """Thin wrapper over the admin REST API; one method per endpoint."""
 
-    def __init__(self, base_url: str, site: str, auth_token: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, auth_token: str, timeout: float = 30.0):
         _require_https(base_url)
         self.base_url = base_url.rstrip("/")
-        self.site = site
         self._http = httpx.Client(
             base_url=self.base_url,
             verify=_verify(),
@@ -91,8 +92,11 @@ class TizraClient:
         self._request("GET", self.admin_path("types", "AdminTagged"))
 
     def admin_path(self, *segments: str) -> str:
-        """Build an `/admin-api/{site}/...` path, escaping each segment."""
-        return "/".join(quote(s, safe="") for s in ["", "admin-api", self.site, *segments])
+        """Build an `/admin-api/_/...` path, escaping each segment.
+
+        The `{site}` segment is always `_`, which names the site of the request's host.
+        """
+        return "/".join(quote(s, safe="") for s in ["", "admin-api", "_", *segments])
 
     def list_types(self, include_props: bool = False) -> Any:
         params = {"table": "true", **({"settable": "true"} if include_props else {})}
@@ -154,18 +158,15 @@ class TizraClient:
         match: list[dict[str, str]] | None = None,
         start: int = 0,
         limit: int = 20,
-        sort_prop: str | None = None,
-        descending: bool = False,
         fields: list[str] | None = None,
     ) -> Any:
+        # No sorting: the match route ignores sort-prop. search_objects can sort.
         params: list[tuple[str, str | int]] = [
             ("meta-type", meta_type), ("start", start), ("limit", limit)
         ]
         params += _selection(parsed_props, fields)
         for m in match or []:
             params += [("match-prop", m["prop"]), ("match-value", m["value"])]
-        if sort_prop:
-            params += [("sort-prop", sort_prop), ("descending", str(descending).lower())]
         # The trailing slash matters: "query" without it is the single-object route.
         listing = "match" if match else ""
         return self._request("GET", self.admin_path("query", listing), params=params)
@@ -202,6 +203,8 @@ class TizraClient:
         start: int = 0,
         limit: int = 20,
         fields: list[str] | None = None,
+        sort_prop: str | None = None,
+        descending: bool = False,
     ) -> Any:
         if not (all or any or excluded):
             raise ValueError("search_objects needs at least one of all, any or excluded")
@@ -215,6 +218,9 @@ class TizraClient:
         params += _selection(parsed_props, fields)
         if meta_type:
             params.append(("meta-type", meta_type))
+        if sort_prop:
+            # invert-order reverses the sort, so true is descending.
+            params += [("sort-prop", sort_prop), ("invert-order", str(descending).lower())]
         return self._request("GET", self.admin_path("query", "search"), params=params)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:

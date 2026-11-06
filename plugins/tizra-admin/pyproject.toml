@@ -1,6 +1,6 @@
 [project]
 name = "tizra-admin-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server giving Claude Code access to the Tizra admin API"
 requires-python = ">=3.11"
 dependencies = [
@@ -19,3 +19,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["server", "tizra_client"]
+
+[dependency-groups]
+test = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The working tree, not the copy of the project installed in the environment.
+pythonpath = [".", "tests"]

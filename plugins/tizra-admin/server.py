@@ -1,7 +1,7 @@
 """MCP server exposing the Tizra admin API to Claude Code over stdio.
 
-Configuration comes from TIZRA_BASE_URL, TIZRA_SITE and TIZRA_AUTH_TOKEN. Any that are missing
-are requested from the user through MCP elicitation on the first tool call that needs the API.
+Configuration comes from TIZRA_BASE_URL and TIZRA_AUTH_TOKEN. Any that are missing are requested
+from the user through MCP elicitation on the first tool call that needs the API.
 Never read stdin or prompt on stderr here: under stdio transport stdin carries the protocol.
 """
 
@@ -35,7 +35,6 @@ CONFIG_VARS = {
         "TIZRA_BASE_URL",
         "The site's URL, e.g. https://www.example.com; its admin host is found from it",
     ),
-    "site": ("TIZRA_SITE", "Site segment of /admin-api/{site}/ (normally _)"),
     "auth_token": ("TIZRA_AUTH_TOKEN", "The site's APIToken site parameter"),
 }
 
@@ -51,6 +50,13 @@ _config: dict[str, str] = {
 }
 _client: TizraClient | None = None
 """The session's client, once the API has accepted its token."""
+
+_lock = threading.Lock()
+"""Guards _config and _client, which concurrent tool calls share from worker threads.
+
+A check of the configuration and the write it justifies happen in one hold. Never held across
+a request or a prompt: a call waiting on either must not stall the others.
+"""
 
 REJECTED_TOKEN = (
     "not authenticated: the site rejected the API token, so it has been forgotten; "
@@ -94,14 +100,16 @@ def get_client(
 
     A new client's token has not been checked yet; see get_checked_client.
     """
-    if _client is not None:
-        return _client
-    missing = _missing()
-    # When ask_config declines to ask, answer arrives as accepted with data None.
-    if missing and isinstance(answer, AcceptedElicitation) and answer.data is not None:
-        values = {key: str(getattr(answer.data, key, "")).strip() for key in missing}
-        _config.update({key: value for key, value in values.items() if value})
+    if (client := _client) is not None:
+        return client
+    with _lock:
         missing = _missing()
+        # When ask_config declines to ask, answer arrives as accepted with data None.
+        if missing and isinstance(answer, AcceptedElicitation) and answer.data is not None:
+            values = {key: str(getattr(answer.data, key, "")).strip() for key in missing}
+            _config.update({key: value for key, value in values.items() if value})
+            missing = _missing()
+        config = dict(_config)
     if missing:
         names = ", ".join(CONFIG_VARS[key][0] for key in missing)
         raise ToolError(
@@ -109,12 +117,18 @@ def get_client(
         )
     try:
         # A public host only redirects the API to the admin host, so move to it up front.
-        _config["base_url"] = find_admin_base_url(_config["base_url"])
-        return TizraClient(_config["base_url"], _config["site"], _config["auth_token"])
+        base_url = find_admin_base_url(config["base_url"])
+        client = TizraClient(base_url, config["auth_token"])
     except ValueError as e:
-        # Forget the rejected base URL so the next call asks again.
-        _config.pop("base_url", None)
+        # Forget the rejected base URL so the next call asks again, unless it has changed.
+        with _lock:
+            if _config.get("base_url") == config["base_url"]:
+                _config.pop("base_url")
         raise ToolError(str(e)) from e
+    with _lock:
+        if _config.get("base_url") == config["base_url"]:
+            _config["base_url"] = base_url
+    return client
 
 
 def _accepts(client: TizraClient) -> bool:
@@ -148,6 +162,21 @@ def ask_token_again(
     )
 
 
+CREDENTIALS_CHANGED = (
+    "the Tizra credentials changed while this call was waiting for a token; try the call again"
+)
+
+
+def _is_current(client: TizraClient) -> bool:
+    """Whether the client was built for the site the configuration names now.
+
+    A call can wait on a token prompt while another forgets the credentials and configures a
+    different site; such a stale call must neither send its token to the new site nor change
+    the new site's cached credentials. Call with _lock held.
+    """
+    return _config.get("base_url", "").rstrip("/") == client.base_url
+
+
 def get_checked_client(
     client: Annotated[TizraClient, Resolve(get_client)],
     retry: Annotated[
@@ -160,37 +189,53 @@ def get_checked_client(
     if client is _client:
         return client
     if not _accepts(client):
-        _config.pop("auth_token", None)
+        with _lock:
+            if not _is_current(client):
+                raise ToolError(CREDENTIALS_CHANGED)
+            _config.pop("auth_token", None)
         token = ""
         if isinstance(retry, AcceptedElicitation) and retry.data is not None:
             token = retry.data.auth_token.strip()
         if not token:
             raise ToolError(REJECTED_TOKEN)
-        client = TizraClient(_config["base_url"], _config["site"], token)
+        # The client's own base URL, not _config's: the prompt named this site.
+        client = TizraClient(client.base_url, token)
         if not _accepts(client):
             raise ToolError(REJECTED_TOKEN)
-        _config["auth_token"] = token
-    _client = client
+    else:
+        token = None
+    with _lock:
+        if not _is_current(client):
+            raise ToolError(CREDENTIALS_CHANGED)
+        if token is not None:
+            _config["auth_token"] = token
+        _client = client
     return client
 
 
-def _forget_token() -> None:
-    """Forget a token the API has stopped accepting, so the next call asks for it."""
+def _forget_token(client: TizraClient) -> None:
+    """Forget a token the API has stopped accepting, so the next call asks for it.
+
+    Only while client is still the session's: a call that started before the credentials
+    changed must not forget the new ones.
+    """
     global _client
-    _client = None
-    _config.pop("auth_token", None)
+    with _lock:
+        if client is _client:
+            _client = None
+            _config.pop("auth_token", None)
 
 
 TizraApi = Annotated[TizraClient, Resolve(get_checked_client)]
 """Tool parameter type for the configured client; filled by the SDK, not by the model."""
 
 
-def _api(call: Callable[[], T]) -> T:
+def _api(client: TizraClient, call: Callable[[], T]) -> T:
     """Run a client call, surfacing API errors to the model as structured tool errors."""
     try:
         return call()
     except TizraAuthError as e:
-        _forget_token()
+        _forget_token(client)
         raise ToolError(json.dumps({**e.to_dict(), "message": REJECTED_TOKEN})) from e
     except TizraError as e:
         raise ToolError(json.dumps(e.to_dict())) from e
@@ -205,9 +250,10 @@ def forget_credentials() -> str:
     values; they are never passed as arguments.
     """
     global _client
-    _client = None
-    _config.pop("base_url", None)
-    _config.pop("auth_token", None)
+    with _lock:
+        _client = None
+        _config.pop("base_url", None)
+        _config.pop("auth_token", None)
     return "Forgot the Tizra base URL and API token; the next call will ask the user for them."
 
 
@@ -230,7 +276,7 @@ with include_inherited, gives a type's complete set.
 {PROP_DEF_ORIGINS}"""
 )
 def list_meta_types(client: TizraApi, include_props: bool = False) -> list[dict[str, Any]]:
-    types = _api(lambda: client.list_types(include_props))
+    types = _api(client, lambda: client.list_types(include_props))
     if include_props:
         return types
     return [{k: t.get(k) for k in TYPE_SUMMARY_KEYS} for t in types]
@@ -246,8 +292,8 @@ each labeled declared-by {{type, source}} with source "local", "super-type" or "
 {PROP_DEF_ORIGINS}"""
 )
 def get_meta_type(client: TizraApi, type_name: str) -> dict[str, Any]:
-    record = _api(lambda: client.get_type(type_name))
-    return {**record, "all-prop-defs": _api(lambda: client.effective_prop_defs(type_name))}
+    record = _api(client, lambda: client.get_type(type_name))
+    return {**record, "all-prop-defs": _api(client, lambda: client.effective_prop_defs(type_name))}
 
 
 @mcp.tool(
@@ -263,8 +309,8 @@ def list_prop_defs(
     client: TizraApi, type_name: str, include_inherited: bool = False
 ) -> list[dict[str, Any]]:
     if include_inherited:
-        return _api(lambda: client.effective_prop_defs(type_name))
-    return _api(lambda: client.list_prop_defs(type_name))
+        return _api(client, lambda: client.effective_prop_defs(type_name))
+    return _api(client, lambda: client.list_prop_defs(type_name))
 
 
 MULTI_TARGET_GUIDANCE = (
@@ -305,13 +351,13 @@ def upsert_prop_def(
         for key, value in locals().items()
         if key not in ("client", "type_name", "prop_name") and value is not None
     }
-    return _api(lambda: client.upsert_prop_def(type_name, prop_name, attributes))
+    return _api(client, lambda: client.upsert_prop_def(type_name, prop_name, attributes))
 
 
 @mcp.tool()
 def remove_prop_def(client: TizraApi, type_name: str, prop_name: str) -> str:
     """Remove a property definition declared locally on a meta-type."""
-    return _api(lambda: client.remove_prop_def(type_name, prop_name))
+    return _api(client, lambda: client.remove_prop_def(type_name, prop_name))
 
 
 SELECTION_GUIDANCE = """Records are complete unless narrowed.
@@ -335,8 +381,10 @@ class PropMatch(BaseModel):
     description=f"""List objects of a meta-type, published or not.
 
 match keeps only objects whose properties have all the given values. Results are paged by
-start/limit; the response's size is the number of results in this page, so a full page means
-there may be more.
+start/limit; count the result array, not size, to determine the page length. A full page means
+there may be more. Results cannot be sorted; for sorted results use search_objects, where a
+match on Prop with value v is the term Prop:v in all. Unlike search_objects, only one value for
+each property can be specified. Repeated values will be ignored.
 
 {SELECTION_GUIDANCE}"""
 )
@@ -348,14 +396,11 @@ def query_objects(
     match: list[PropMatch] | None = None,
     start: int = 0,
     limit: int = 20,
-    sort_prop: str | None = None,
-    descending: bool = False,
 ) -> dict[str, Any]:
     matches = [m.model_dump() for m in match or []]
     return _api(
-        lambda: client.query_objects(
-            meta_type, parsed_props, matches, start, limit, sort_prop, descending, fields
-        )
+        client,
+        lambda: client.query_objects(meta_type, parsed_props, matches, start, limit, fields)
     )
 
 
@@ -372,7 +417,7 @@ def get_object(
     parsed_props: list[str] | None = None,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
-    return _api(lambda: client.get_object(tizra_id, parsed_props, fields))
+    return _api(client, lambda: client.get_object(tizra_id, parsed_props, fields))
 
 
 @mcp.tool(
@@ -386,7 +431,7 @@ state; use publish_object to make them visible on staging or live.
 {MULTI_TARGET_GUIDANCE.format(targets="objects", target="object")}"""
 )
 def update_object_props(client: TizraApi, tizra_id: str, props: dict[str, Any]) -> dict[str, Any]:
-    return _api(lambda: client.update_object_props(tizra_id, props))
+    return _api(client, lambda: client.update_object_props(tizra_id, props))
 
 
 @mcp.tool()
@@ -396,7 +441,7 @@ def create_object(client: TizraApi, meta_type: str, props: dict[str, Any]) -> di
     props takes the same shape as update_object_props: values in their parsed-props form.
     Returns the new object's tizra-id, url-id and management-url.
     """
-    return _api(lambda: client.create_object(meta_type, props))
+    return _api(client, lambda: client.create_object(meta_type, props))
 
 
 class DeleteConfirmation(BaseModel):
@@ -409,9 +454,13 @@ def ask_delete(
     """Ask the user to confirm a deletion, naming the object; None when the client can't ask."""
     if not _can_elicit(ctx):
         return None
-    obj = _api(lambda: client.get_object(tizra_id))
+    obj = _api(client, lambda: client.get_object(tizra_id))
+    if tizra_id != obj.get("tizra-id"):
+        raise ToolError(
+            f"Deletion requires a canonical tizra-id; call delete_object again with {obj['tizra-id']}."
+        )
     props = obj.get("parsed-props") or {}
-    meta_type = _api(lambda: client.get_type(obj["meta-type"]))
+    meta_type = _api(client, lambda: client.get_type(obj["meta-type"]))
     name_prop = meta_type.get("name-prop-name") or "Title"
     title = props.get(name_prop) or props.get("Title") or obj.get("name")
     # Without a custom URL, the API reports the tizra-id as the url-id.
@@ -442,7 +491,7 @@ def delete_object(
         )
     if not (accepted and confirmation.data.confirm):
         return f"Deletion of {tizra_id} cancelled by the user; nothing was deleted."
-    result = _api(lambda: client.delete_object(tizra_id))
+    result = _api(client, lambda: client.delete_object(tizra_id))
     return f"Deleted {tizra_id}: {result.get('message') if isinstance(result, dict) else result}"
 
 
@@ -455,7 +504,7 @@ def publish_object(
     live publishes to the public site, staging publishes for administrative preview, and
     unpublish withdraws it. Publishing copies the object's current CMS state.
     """
-    return _api(lambda: client.publish_object(tizra_id, operation))
+    return _api(client, lambda: client.publish_object(tizra_id, operation))
 
 
 @mcp.tool(
@@ -472,7 +521,8 @@ one in any, and none in excluded. Each term is a property expression, not free t
                          value for Prop. The braces are required: has-value:Prop without
                          them is accepted but matches nothing.
 A bare word matches AdminTags only. meta_type limits results to that type; when omitted,
-all types are searched. Malformed terms are reported as errors.
+all types are searched. Malformed terms are reported as errors. sort_prop sorts the results
+by that property's value, ascending unless descending is set.
 
 {SELECTION_GUIDANCE}"""
 )
@@ -486,11 +536,15 @@ def search_objects(
     fields: list[str] | None = None,
     start: int = 0,
     limit: int = 20,
+    sort_prop: str | None = None,
+    descending: bool = False,
 ) -> dict[str, Any]:
     try:
         return _api(
+            client,
             lambda: client.search_objects(
-                all, any, excluded, meta_type, parsed_props, start, limit, fields
+                all, any, excluded, meta_type, parsed_props, start, limit, fields, sort_prop,
+                descending,
             )
         )
     except ValueError as e:
@@ -530,8 +584,11 @@ def execute_code(client: TizraApi, code: str, timeout: float = 60) -> dict[str, 
             exec(compile(code, "<execute_code>", "exec"), namespace)
         except BaseException as e:
             if isinstance(e, TizraAuthError):
-                _forget_token()
-            failure.append(traceback.format_exc())
+                _forget_token(client)
+            error = traceback.format_exc()
+            if isinstance(e, TizraError):
+                error = f"{json.dumps(e.to_dict())}\n{error}"
+            failure.append(error)
 
     thread = threading.Thread(target=run, name="execute_code", daemon=True)
     thread.start()
