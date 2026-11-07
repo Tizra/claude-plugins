@@ -73,6 +73,8 @@ def load() -> Sites:
             invalid[key] = "the key must be a host, like www.example.com, not a URL"
         elif not isinstance(token, str) or not token.strip():
             invalid[key] = "the entry has no token"
+        elif any(c != "\t" and not (0x20 <= ord(c) <= 0x7e) for c in token.strip()):
+            invalid[key] = "the token contains characters that cannot be sent in an HTTP header"
         elif host in entries:
             invalid[key] = f"another entry is also for {host}"
         else:

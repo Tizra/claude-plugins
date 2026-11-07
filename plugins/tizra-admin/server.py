@@ -34,6 +34,7 @@ T = TypeVar("T")
 
 # httpx logs every request at INFO; on stderr that is just noise in Claude Code's MCP log.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("tizra-admin")
 
 CONFIG_VARS = {
     "base_url": (
@@ -63,6 +64,12 @@ elicitation may still ignore the answers, leaving an implicit prompt to hang the
 _client: TizraClient | None = None
 """The session's client, once the API has accepted its token."""
 
+_token_file_used = False
+"""Whether this pinned session has taken its token from the credentials file.
+
+If so, list_sites reports the file's permissions warning, as select_credentials would.
+"""
+
 _lock = threading.Lock()
 """Guards _config and _client, which concurrent tool calls share from worker threads.
 
@@ -89,7 +96,10 @@ REJECTED_SELECTED_TOKEN = (
 
 
 def _refuse_if_pinned() -> None:
-    """Refuse to change a pinned session's site: nothing the model reads may move it."""
+    """Refuse to change a pinned session's site through the credential tools.
+
+    Not a sandbox: code run by execute_code shares this process and can get around it.
+    """
     if _pinned:
         with _lock:
             url = _config.get("base_url") or os.environ.get("TIZRA_BASE_URL", "").strip()
@@ -116,13 +126,21 @@ def _token_from_file() -> None:
             return
         url = os.environ.get("TIZRA_BASE_URL", "").strip() or _config["base_url"]
     try:
-        found = site_credentials.match(url, site_credentials.load().entries)
+        sites = site_credentials.load()
+        found = site_credentials.match(url, sites.entries)
     except ValueError:
         return
-    if found is not None:
-        with _lock:
-            if "base_url" in _config:
-                _config.setdefault("auth_token", found[1])
+    if found is None:
+        return
+    global _token_file_used
+    with _lock:
+        if "base_url" not in _config or "auth_token" in _config:
+            return
+        _config["auth_token"] = found[1]
+        _token_file_used = True
+    if sites.warning:
+        # Not a tool result, so the model may not see it; list_sites reports it too.
+        log.warning(sites.warning)
 
 
 def _can_elicit(ctx: Context) -> bool:
@@ -320,20 +338,30 @@ def list_sites() -> dict[str, Any]:
 
     The sites come from the user's credentials file; their API tokens are never shown. Also
     reports the site in use, if any, entries that cannot be used and why, and whether the
-    session is pinned to one site by environment variables, in which case it cannot switch.
+    session is pinned to one site by environment variables, in which case it cannot switch,
+    and, if that session's token came from the file, a warning when others can read the file.
     """
     with _lock:
         current = _client.base_url if _client is not None else None
     if _pinned:
         with _lock:
             url = _config.get("base_url") or os.environ.get("TIZRA_BASE_URL", "").strip()
-        return {
+        pinned: dict[str, Any] = {
             "mode": "pinned",
             "pinned_to": url or None,
             "current_site": current,
             "note": "This session is pinned by the TIZRA_BASE_URL and TIZRA_AUTH_TOKEN "
             "environment variables; select_credentials and enter_credentials are unavailable.",
         }
+        if _token_file_used:
+            pinned["token_from"] = str(site_credentials.path())
+            try:
+                warning = site_credentials.load().warning
+            except ValueError:
+                warning = None
+            if warning:
+                pinned["warning"] = warning
+        return pinned
     sites = _load_sites()
     result: dict[str, Any] = {
         "mode": "file",

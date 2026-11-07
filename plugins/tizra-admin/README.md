@@ -64,9 +64,10 @@ the desktop application below. `forget_credentials` drops the selected site, lea
 | `TIZRA_AUTH_TOKEN` | The site's API token                                                  |
 
 When either variable is set, the session is pinned to that site. `select_credentials`,
-`enter_credentials` and `forget_credentials` refuse, so nothing Claude reads can move the session
-to another site. With `TIZRA_BASE_URL` alone, the token is taken from the credentials file's entry
-for that host. Anything still missing is requested from you inside Claude Code on the first tool
+`enter_credentials` and `forget_credentials` refuse, so Claude cannot move the session to another
+site through those tools. That is not a sandbox: code run by `execute_code` can still read the
+credentials file and reach any site in it. With `TIZRA_BASE_URL` alone, the token is taken from the
+credentials file's entry for that host; if other users can read the file, `list_sites` says so. Anything still missing is requested from you inside Claude Code on the first tool
 call, and kept for the session; entered that way, the token goes straight to the server. If your
 client cannot ask, the tool reports which variables to set.
 
