@@ -30,6 +30,9 @@ ADMIN_MAIN = "/admin/main"
 
 MAX_ADMIN_HOPS = 5
 
+KEYWORD_COLON = "\u02d0"
+"""Stands for a colon inside a search term's value, where a colon would separate its parts."""
+
 
 def _require_https(base_url: str) -> None:
     if httpx.URL(base_url).scheme != "https":
@@ -222,6 +225,28 @@ class TizraClient:
             # invert-order reverses the sort, so true is descending.
             params += [("sort-prop", sort_prop), ("invert-order", str(descending).lower())]
         return self._request("GET", self.admin_path("query", "search"), params=params)
+
+    def find_exact(
+        self, matches: list[tuple[str, str]], meta_type: str | None = None, limit: int = 20
+    ) -> Any:
+        """Objects in the CMS state whose properties hold every given value exactly.
+
+        Each pair becomes a search term strict:AdminTagged:Prop:value. strict makes the match
+        exact and case-sensitive; AdminTagged, the super-type of every content type, makes it
+        apply to all types (the type in a term doesn't filter, so meta_type is sent apart). With
+        check-syntax each term is parsed alone, so ; and \\ need no escaping, but : separates a
+        term's parts: a colon in a value is sent as the look-alike \u02d0, which the server
+        reads back as a colon.
+        """
+        if not matches:
+            raise ValueError("find_exact needs at least one property and value")
+        if any(not prop.strip() or not value.strip() for prop, value in matches):
+            raise ValueError("find_exact needs a nonblank property and value in every pair")
+        terms = [
+            f"strict:AdminTagged:{prop}:{value.replace(':', KEYWORD_COLON)}"
+            for prop, value in matches
+        ]
+        return self.search_objects(all=terms, meta_type=meta_type, limit=limit)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         """Make a request and return its parsed body, raising TizraError on failure."""

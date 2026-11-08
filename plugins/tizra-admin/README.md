@@ -115,7 +115,7 @@ to the site through the API, so treat it like an administrator's password.
 | `get_object`          | One object by tizra-id or url-id                                      |
 | `create_object`       | Create an object                                                      |
 | `update_object_props` | Set properties on an object                                           |
-| `delete_object`       | Delete an object, after you confirm its title and URL in Claude Code  |
+| `delete_object`       | Delete by tizra-id or exact `match`; you choose among the matches     |
 | `publish_object`      | `live`, `staging` or `unpublish`                                      |
 | `execute_code`        | Run Python with a `client` for batch work (no deletes)                |
 | `list_sites`          | The sites in your credentials file, and the one in use                |

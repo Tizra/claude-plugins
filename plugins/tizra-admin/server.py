@@ -16,9 +16,11 @@ import logging
 import os
 import re
 import threading
+import tomllib
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
 from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
@@ -44,8 +46,17 @@ CONFIG_VARS = {
     "auth_token": ("TIZRA_AUTH_TOKEN", "The site's APIToken site parameter"),
 }
 
+with Path(__file__).with_name("pyproject.toml").open("rb") as _pyproject:
+    VERSION: str = tomllib.load(_pyproject)["project"]["version"]
+"""This release's version, reported in serverInfo so a client's MCP log shows which ran.
+
+Read from the file beside this module, not installed package metadata, which can lag it: the
+plugin's environment outlives any one plugin version. No fallback; every launch runs from here.
+"""
+
 mcp = MCPServer(
     "tizra-admin",
+    version=VERSION,
     instructions="Read and modify Tizra content and meta-types through the admin API.",
 )
 
@@ -731,51 +742,176 @@ class DeleteConfirmation(BaseModel):
     confirm: bool = Field(description="Delete this object")
 
 
+MAX_DELETE_CANDIDATES = 25
+"""The most objects one delete confirmation lists. Deleting objects the user can't be shown
+individually is out of scope (the spec's scope boundary on deletion)."""
+
+
+def find_delete_candidates(
+    client: TizraApi,
+    tizra_id: str | None,
+    match: list[PropMatch] | None,
+    meta_type: str | None,
+) -> list[dict[str, Any]]:
+    """The records delete_object would offer to delete; a ToolError when there are none to offer."""
+    if (tizra_id is None) == (not match):
+        raise ToolError("Not deleted: give either tizra_id or match, not both or neither.")
+    if tizra_id is not None:
+        obj = _api(client, lambda: client.get_object(tizra_id))
+        if tizra_id != obj.get("tizra-id"):
+            raise ToolError(
+                "Deletion requires a canonical tizra-id; "
+                f"call delete_object again with {obj['tizra-id']}."
+            )
+        return [obj]
+    pairs = [(m.prop, m.value) for m in match or []]
+    try:
+        found = _api(
+            client, lambda: client.find_exact(pairs, meta_type, MAX_DELETE_CANDIDATES + 1)
+        )["result"]
+    except ValueError as e:
+        raise ToolError(f"Not deleted: {e}.") from e
+    if not found:
+        raise ToolError("Not deleted: no object matches.")
+    if len(found) > MAX_DELETE_CANDIDATES:
+        raise ToolError(
+            f"Not deleted: more than {MAX_DELETE_CANDIDATES} objects match; "
+            "narrow match or give meta_type."
+        )
+    return found
+
+
 def ask_delete(
-    tizra_id: str, client: TizraApi, ctx: Context
-) -> Elicit[DeleteConfirmation] | None:
-    """Ask the user to confirm a deletion, naming the object; None when the client can't ask."""
+    candidates: Annotated[list[dict[str, Any]], Resolve(find_delete_candidates)],
+    client: TizraApi,
+    ctx: Context,
+) -> Elicit[BaseModel] | None:
+    """Ask the user which candidates to delete, naming each; None when the client can't ask.
+
+    One candidate gets a yes/no question. Several get one multi-select whose values can only be
+    their tizra-ids, so the answer can't name an object the user wasn't shown.
+    """
     if not _can_elicit(ctx):
         return None
-    obj = _api(client, lambda: client.get_object(tizra_id))
-    if tizra_id != obj.get("tizra-id"):
-        raise ToolError(
-            f"Deletion requires a canonical tizra-id; call delete_object again with {obj['tizra-id']}."
+    name_props = _name_props(client, candidates)
+    if len(candidates) == 1:
+        obj = candidates[0]
+        return Elicit(
+            f"Delete '{_object_name(obj, name_props)}' ({_object_where(obj)})?",
+            DeleteConfirmation,
         )
+    ids = tuple(obj["tizra-id"] for obj in candidates)
+    options = [
+        {"const": obj["tizra-id"], "title": _object_label(obj, name_props)} for obj in candidates
+    ]
+    selection = create_model(
+        "DeleteSelection",
+        delete=(list[Literal[ids]], Field(
+            default=[],
+            description="The objects to delete",
+            json_schema_extra={"items": {"anyOf": options}},
+        )),
+    )
+    return Elicit(
+        f"Delete which of these {len(candidates)} objects? Only those you select are deleted.",
+        selection,
+    )
+
+
+def _name_props(client: TizraClient, records: list[dict[str, Any]]) -> dict[str, str]:
+    """The name-prop-name of each meta-type among records, reading each type once."""
+    names: dict[str, str] = {}
+    for meta_type in {r["meta-type"] for r in records}:
+        info = _api(client, lambda: client.get_type(meta_type))
+        names[meta_type] = info.get("name-prop-name") or "Title"
+    return names
+
+
+def _object_name(obj: dict[str, Any], name_props: dict[str, str]) -> Any:
     props = obj.get("parsed-props") or {}
-    meta_type = _api(client, lambda: client.get_type(obj["meta-type"]))
-    name_prop = meta_type.get("name-prop-name") or "Title"
-    title = props.get(name_prop) or props.get("Title") or obj.get("name")
+    return props.get(name_props[obj["meta-type"]]) or props.get("Title") or obj.get("name")
+
+
+def _object_label(obj: dict[str, Any], name_props: dict[str, str]) -> str:
+    if obj.get("published-live"):
+        status = "live"
+    elif obj.get("published-staging"):
+        status = "staging"
+    else:
+        status = "not published"
+    where = _object_where(obj)
+    return f"'{_object_name(obj, name_props)}' ({obj['meta-type']}, {status}, {where})"
+
+
+def _object_where(obj: dict[str, Any]) -> str:
+    # Always name the tizra-id: a retried call reuses an answer only for an identical question,
+    # so a replacement with the same name and custom URL must not ask the same one.
     # Without a custom URL, the API reports the tizra-id as the url-id.
+    tizra_id = obj["tizra-id"]
     url_id = obj.get("url-id")
-    custom = url_id and url_id != obj.get("tizra-id")
-    where = f"url: {url_id}" if custom else f"tizra-id: {tizra_id}"
-    return Elicit(f"Delete '{title}' ({where})?", DeleteConfirmation)
+    custom = url_id and url_id != tizra_id
+    return f"url: {url_id}, tizra-id: {tizra_id}" if custom else f"tizra-id: {tizra_id}"
 
 
-@mcp.tool()
+@mcp.tool(
+    description=f"""Delete objects, after the user confirms which. Give tizra_id or match, not both.
+
+tizra_id must be the object's own tizra-id; a url-id is refused, with the tizra-id to use.
+match finds objects by exact metadata: every prop must hold its value exactly and
+case-sensitively (one member of a list property such as Authors is enough, and a property given
+twice needs both values). meta_type limits the match to one meta-type; without it, every type is
+searched. Unpublished objects are included.
+
+The user is shown each object found, named by its meta-type's name property, and decides: a
+yes/no question for one object, or a list to choose from for up to {MAX_DELETE_CANDIDATES}. More
+matches than that is an error; narrow match or give meta_type. Only the objects the user
+selects are deleted, and the result reports each one. There is no way to confirm on the
+user's behalf.
+
+To delete several objects that share metadata, such as a title, make one call with match and
+let the user choose among them, rather than spawning a sub-agent per object."""
+)
 def delete_object(
     client: TizraApi,
-    tizra_id: str,
+    candidates: Annotated[list[dict[str, Any]], Resolve(find_delete_candidates)],
     confirmation: Annotated[
-        AcceptedElicitation[DeleteConfirmation] | DeclinedElicitation | CancelledElicitation | None,
+        AcceptedElicitation[BaseModel] | DeclinedElicitation | CancelledElicitation | None,
         Resolve(ask_delete),
     ],
+    tizra_id: str | None = None,
+    match: list[PropMatch] | None = None,
+    meta_type: str | None = None,
 ) -> str:
-    """Delete an object. The user is asked to confirm, shown the object's title and URL.
-
-    Deletion only happens if the user confirms; there is no way to confirm on the user's behalf.
-    """
     accepted = isinstance(confirmation, AcceptedElicitation)
     # A resolver that returns None instead of asking arrives as accepted with no data.
     if confirmation is None or (accepted and confirmation.data is None):
         raise ToolError(
             "Not deleted: this client cannot ask the user for confirmation (MCP elicitation)."
         )
-    if not (accepted and confirmation.data.confirm):
-        return f"Deletion of {tizra_id} cancelled by the user; nothing was deleted."
-    result = _api(client, lambda: client.delete_object(tizra_id))
-    return f"Deleted {tizra_id}: {result.get('message') if isinstance(result, dict) else result}"
+    if not accepted:
+        return "Deletion cancelled by the user; nothing was deleted."
+    if len(candidates) > 1:
+        selected = confirmation.data.delete
+        if not selected:
+            return "No objects were selected; nothing was deleted."
+        lines = []
+        # Carry on past a failure: the user chose each of these, and the rest may still succeed.
+        for target in selected:
+            try:
+                result = _api(client, lambda: client.delete_object(target))
+                lines.append(f"Deleted {target}: {_delete_message(result)}")
+            except ToolError as e:
+                lines.append(f"Failed to delete {target}: {e}")
+        return "\n".join(lines)
+    target = candidates[0]["tizra-id"]
+    if not confirmation.data.confirm:
+        return f"Deletion of {target} cancelled by the user; nothing was deleted."
+    result = _api(client, lambda: client.delete_object(target))
+    return f"Deleted {target}: {_delete_message(result)}"
+
+
+def _delete_message(result: Any) -> Any:
+    return result.get("message") if isinstance(result, dict) else result
 
 
 @mcp.tool()
@@ -840,7 +976,7 @@ def execute_code(client: TizraApi, code: str, timeout: float = 60) -> dict[str, 
 
     The code runs with these names defined: client (a TizraClient, with methods list_types,
     get_type, list_prop_defs, effective_prop_defs, upsert_prop_def, remove_prop_def,
-    query_objects, get_object, update_object_props, create_object, publish_object,
+    query_objects, find_exact, get_object, update_object_props, create_object, publish_object,
     search_objects; deletion is deliberately not available here), json, re, and results (a
     list to append output to).
     Client methods raise tizra_client.TizraError with status, message and detail.
