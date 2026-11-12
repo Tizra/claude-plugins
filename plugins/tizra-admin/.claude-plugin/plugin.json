@@ -1,6 +1,6 @@
 {
   "name": "tizra-admin",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Read and modify Tizra content and meta-types through the admin API",
   "author": {
     "name": "Tizra"

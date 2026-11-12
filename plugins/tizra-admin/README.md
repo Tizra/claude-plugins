@@ -1,9 +1,9 @@
 # tizra-admin
 
 A Claude Code plugin that gives Claude read and write access to a Tizra site through the admin
-REST API: meta-types and their property definitions, objects, search, publishing, and a Python
-`execute_code` tool for batch work. It has no tools for source files (PDF/ePub uploads, page
-text).
+REST API: meta-types and their property definitions, objects, search, publishing, the files
+attached to objects, and a Python `execute_code` tool for batch work. It has no tools for page
+text.
 
 ## Install
 
@@ -79,7 +79,8 @@ call asks again.
 
 The desktop application says it can ask you for input, but it never passes your answers back to
 the server, so a request for credentials there never completes. Use the credentials file. For
-the same reason, `delete_object`, which needs your confirmation, cannot delete anything there.
+the same reason, `delete_object` and `delete_file`, which need your confirmation, cannot delete
+anything there.
 
 ### Hosts, https and tokens
 
@@ -117,6 +118,11 @@ to the site through the API, so treat it like an administrator's password.
 | `update_object_props` | Set properties on an object                                           |
 | `delete_object`       | Delete by tizra-id or exact `match`; you choose among the matches     |
 | `publish_object`      | `live`, `staging` or `unpublish`                                      |
+| `list_files`          | The files in one of an object's sources, or in all of them            |
+| `upload_file`         | Create or replace a file from a local path                            |
+| `download_file`       | Save a file's content to a local path                                 |
+| `update_file`         | Rename a file, or set its content type, sort field or props           |
+| `delete_file`         | Delete one file, named exactly, after you confirm                     |
 | `execute_code`        | Run Python with a `client` for batch work (no deletes)                |
 | `list_sites`          | The sites in your credentials file, and the one in use                |
 | `select_credentials`  | Use a site from the credentials file                                  |
@@ -137,6 +143,13 @@ default definitions from its chain of system base-types. `get_meta_type`'s `all-
 
 Search terms are property expressions, not free text; the `search_objects` tool description
 gives the grammar.
+
+An object's files are kept in its sources: `PdfSource` for the content readers see,
+`Attachments` and `FreeAttachments` for display assets and downloads, and `PropSource` for
+files that are the values of file properties such as `CoverImage`. Files go between your disk and
+the site directly, never through the conversation, so give Claude full paths. Uploads change
+the unpublished (CMS) state; ask Claude to publish to show them. Claude uploads into `PropSource`
+only under the name of a file property, unless you ask for another name explicitly.
 
 `execute_code` runs Python inside the plugin's server process on your machine. It is not a
 sandbox, so read what Claude proposes to run before approving it.

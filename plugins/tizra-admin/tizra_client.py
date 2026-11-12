@@ -1,7 +1,7 @@
 """HTTP client for the Tizra admin REST API."""
 
 import ssl
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import quote
 
 import httpx
@@ -248,18 +248,77 @@ class TizraClient:
         ]
         return self.search_objects(all=terms, meta_type=meta_type, limit=limit)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Make a request and return its parsed body, raising TizraError on failure."""
+    def get_source(self, tizra_id: str, source: str) -> Any:
+        """A source's record in the CMS state; its `files` lists the files in order."""
+        return self._request("GET", self.admin_path("objects", tizra_id, source))
+
+    def put_file(
+        self, tizra_id: str, source: str, name: str, content: BinaryIO, size: int, content_type: str
+    ) -> dict[str, Any]:
+        """Create a file, or replace the content of the file of that name, streaming `content`.
+
+        Returns `{"created": bool}`, or `{"external": url}` when the file's content is stored at
+        an external URL, in which case the API redirects there and nothing is changed.
+        """
+        path = self.admin_path("objects", tizra_id, source, name)
+        headers = {"content-type": content_type, "content-length": str(size)}
+        response = self._send("PUT", path, content=content, headers=headers)
+        if external := _external_location(response):
+            return {"external": external}
+        body = self._parse(response)
+        status = body.get("status") if isinstance(body, dict) else None
+        if isinstance(status, int) and status >= 400:
+            raise TizraError(status, str(body.get("message") or "upload failed"))
+        return {"created": status == 201 or response.status_code == 201}
+
+    def download_file(self, tizra_id: str, source: str, name: str, out: BinaryIO) -> dict[str, Any]:
+        """Write a file's content in the CMS state to `out`.
+
+        Returns `{"content-type": str, "size": int}`, or `{"external": url}` when the content
+        is stored at an external URL; nothing is then written.
+        """
+        path = self.admin_path("objects", tizra_id, source, name)
         try:
-            response = self._http.request(method, path, **kwargs)
+            with self._http.stream("GET", path) as response:
+                if external := _external_location(response):
+                    return {"external": external}
+                if response.is_redirect or response.is_error:
+                    response.read()
+                    self._check(response)
+                size = 0
+                for chunk in response.iter_bytes():
+                    out.write(chunk)
+                    size += len(chunk)
+                return {"content-type": response.headers.get("content-type"), "size": size}
         except httpx.HTTPError as e:
             raise TizraError(0, f"request failed: {e}") from e
+
+    def update_file(self, tizra_id: str, source: str, name: str, changes: dict[str, Any]) -> Any:
+        """Apply `changes` (name, content-type, sort-field, props) to a file's settings."""
+        path = self.admin_path("objects", tizra_id, source, name)
+        return self._request("POST", path, json={"operation": "update", **changes})
+
+    def delete_file(self, tizra_id: str, source: str, name: str) -> Any:
+        return self._request("DELETE", self.admin_path("objects", tizra_id, source, name))
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Make a request and return its parsed body, raising TizraError on failure."""
+        return self._parse(self._send(method, path, **kwargs))
+
+    def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        try:
+            return self._http.request(method, path, **kwargs)
+        except httpx.HTTPError as e:
+            raise TizraError(0, f"request failed: {e}") from e
+
+    def _check(self, response: httpx.Response) -> None:
+        """Raise TizraError for a redirect or an error response."""
         if response.is_redirect:
             # Never follow: a rejected token redirects to the login page, and a public host
             # redirects to the site's admin host. Either way the configuration is wrong.
             location = response.headers.get("location") or ""
             detail = {"location": location}
-            if "/login" in location:
+            if _is_login_redirect(response):
                 message = "not authenticated: the API token does not match the site's APIToken"
                 raise TizraAuthError(response.status_code, message, detail)
             message = (
@@ -269,6 +328,10 @@ class TizraClient:
             raise TizraError(response.status_code, message, detail)
         if response.is_error:
             raise _normalize_error(response)
+
+    def _parse(self, response: httpx.Response) -> Any:
+        """The parsed body of a response, raising TizraError for a redirect or an error."""
+        self._check(response)
         if not response.content:
             # Object updates answer with an empty body and the object's Location header.
             return {"status": response.status_code, "location": response.headers.get("location")}
@@ -276,6 +339,33 @@ class TizraClient:
             return response.json()
         except ValueError:
             return response.text
+
+
+def _external_location(response: httpx.Response) -> str | None:
+    """The URL of a file stored externally, which the API answers with an HTTP 307 to it.
+
+    A redirect to the login page is a rejected token, not a file.
+    """
+    location = response.headers.get("location") or ""
+    if response.status_code == 307 and location and not _is_login_redirect(response):
+        return location
+    return None
+
+
+def _is_login_redirect(response: httpx.Response) -> bool:
+    """Whether a redirect leads to the site's own login page, the API's answer to a bad token.
+
+    Only a path under /login on the host that was asked counts: an external file's URL may
+    contain /login anywhere, and must not be mistaken for a rejected token.
+    """
+    location = response.headers.get("location")
+    if not location:
+        return False
+    target = response.request.url.join(location)
+    path = target.path
+    return target.host == response.request.url.host and (
+        path == "/login" or path.startswith("/login/")
+    )
 
 
 def _normalize_error(response: httpx.Response) -> TizraError:

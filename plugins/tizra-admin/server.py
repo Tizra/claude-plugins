@@ -13,8 +13,10 @@ import ctypes
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
+import tempfile
 import threading
 import tomllib
 import traceback
@@ -926,6 +928,346 @@ def publish_object(
     return _api(client, lambda: client.publish_object(tizra_id, operation))
 
 
+SOURCES_GUIDE = """An object's files are kept in its sources (file attachment areas), which its
+meta-type names. The common ones:
+  PdfSource        the content published to the reader: PDF, ePub, images, plain text or XHTML.
+                   Changing it makes the site repaginate the object, and can reset its bookmarks
+                   and the excerpts drawn from it.
+  Attachments      access-controlled files: display assets, or downloads when a file's
+                   isDownload property is true.
+  FreeAttachments  the same, never access-controlled.
+  PropSource       files that are the values of file (param-file) properties, each file named
+                   for its property, e.g. CoverImage; the property then holds the file's URL.
+A file is served at /{url-id}/~~{source}/{file name}. Files are named exactly as list_files
+reports them; a position in the source is never accepted in place of a name."""
+
+CMS_NOTE = (
+    "The change is in the CMS state only; publish_object makes it visible on staging or live."
+)
+
+
+def _absolute(path: str) -> Path:
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ToolError(
+            f"{path!r} is not an absolute path; give the full path, since this server's working "
+            "directory is not yours."
+        )
+    return p
+
+
+def _file_entry(source: str, position: int, record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": source,
+        "name": record.get("name"),
+        "position": position,
+        "content-type": record.get("content-type"),
+        "size": record.get("size"),
+        "url": record.get("url"),
+        "date-uploaded": record.get("date-uploaded"),
+        "props": record.get("props") or {},
+    }
+
+
+def _object_sources(client: TizraClient, tizra_id: str) -> dict[str, list[dict[str, Any]]]:
+    """Each of the object's sources, by name, with its files in order, in the CMS state.
+
+    Only sources that have been created are listed; a source the type allows but no file has
+    been put in yet is absent, which costs nothing here since it has no files.
+    """
+    record = _api(client, lambda: client.get_object(tizra_id, fields=["sources"]))
+    sources = record.get("sources") or {}
+    if isinstance(sources, list):
+        sources = {s.get("name"): s for s in sources}
+    return {
+        name: [_file_entry(name, i, f) for i, f in enumerate((s or {}).get("files") or [])]
+        for name, s in sources.items()
+    }
+
+
+def _source_files(client: TizraClient, tizra_id: str, source: str) -> list[dict[str, Any]]:
+    """The files in one source, in order, in the CMS state; the API's 404 for an unknown source.
+
+    Asked of the source itself, not the object record, which omits sources not yet created.
+    """
+    record = _api(client, lambda: client.get_source(tizra_id, source))
+    return [_file_entry(source, i, f) for i, f in enumerate(record.get("files") or [])]
+
+
+def _named_file(files: list[dict[str, Any]], source: str, name: str) -> dict[str, Any]:
+    """The file of exactly this name; a ToolError naming the files when there is none."""
+    for f in files:
+        if f["name"] == name:
+            return f
+    if name.isdigit() and int(name) < len(files):
+        raise ToolError(
+            f"No file in {source} is named {name!r}, and a position is not accepted as a name. "
+            f"The file at position {name} is {files[int(name)]['name']!r}."
+        )
+    names = ", ".join(repr(f["name"]) for f in files) or "none"
+    raise ToolError(f"No file in {source} is named {name!r}; its files are: {names}.")
+
+
+@mcp.tool(
+    description=f"""List the files in one source of an object, or in all of its sources.
+
+Each file is reported with its source, name, position, content-type, size, url, date-uploaded
+and props, as the object is in the CMS state.
+
+{SOURCES_GUIDE}"""
+)
+def list_files(
+    client: TizraApi, tizra_id: str, source: str | None = None
+) -> list[dict[str, Any]]:
+    if source is not None:
+        return _source_files(client, tizra_id, source)
+    return [f for files in _object_sources(client, tizra_id).values() for f in files]
+
+
+def _file_props(client: TizraClient, tizra_id: str) -> tuple[str, list[str]]:
+    """The object's meta-type and the names of its file (param-file) properties."""
+    meta_type = _api(client, lambda: client.get_object(tizra_id, fields=["meta-type"]))["meta-type"]
+    defs = _api(client, lambda: client.effective_prop_defs(meta_type))
+    return meta_type, sorted(d["name"] for d in defs if d.get("type") == FILE_PROP_TYPE)
+
+
+FILE_PROP_TYPE = "param-file"
+
+
+@mcp.tool(
+    description=f"""Upload a local file into one of an object's sources, creating the file or
+replacing the content of the file of that name. The content is read from path, which must be
+absolute; it never passes through this conversation.
+
+name defaults to the last part of path, and content_type to one guessed from the name or path.
+props, if given, are set on the file afterwards (string values, e.g. {{"isDownload": "true"}}).
+Replacing a file keeps its existing props. Returns whether the file was created or replaced,
+and its URL.
+
+In PropSource, name is the property the file is the value of, e.g. CoverImage, which must be a
+file (param-file) property of the object's meta-type. Any other name is refused, because the
+file would belong to no property; set unlinked_ok only when the user has explicitly asked for
+a file of that name in PropSource.
+
+A file stored at an external URL is not changed; the result says so and gives the URL.
+
+{CMS_NOTE}
+
+{SOURCES_GUIDE}"""
+)
+def upload_file(
+    client: TizraApi,
+    tizra_id: str,
+    source: str,
+    path: str,
+    name: str | None = None,
+    content_type: str | None = None,
+    props: dict[str, str] | None = None,
+    unlinked_ok: bool = False,
+) -> dict[str, Any]:
+    local = _absolute(path)
+    if not local.is_file() or not os.access(local, os.R_OK):
+        raise ToolError(f"{path} is not a readable file; nothing was uploaded.")
+    name = name or local.name
+    if source == "PropSource" and not unlinked_ok:
+        meta_type, file_props = _file_props(client, tizra_id)
+        if name not in file_props:
+            raise ToolError(
+                f"Not uploaded: {name!r} is not a file property of {meta_type}, so a file of "
+                "that name in PropSource would be the value of no property. "
+                f"{meta_type}'s file properties are: {', '.join(file_props) or 'none'}. "
+                "Set unlinked_ok only if the user explicitly asked for this file in PropSource."
+            )
+    content_type = (
+        content_type
+        or mimetypes.guess_type(name)[0]
+        or mimetypes.guess_type(local.name)[0]
+        or "application/octet-stream"
+    )
+    with local.open("rb") as content:
+        size = local.stat().st_size
+        result = _api(
+            client,
+            lambda: client.put_file(tizra_id, source, name, content, size, content_type),
+        )
+    if "external" in result:
+        return {
+            "changed": False,
+            "message": f"{name} in {source} is stored at an external URL, so it was not changed.",
+            "url": result["external"],
+        }
+    if props:
+        _api(client, lambda: client.update_file(tizra_id, source, name, {"props": props}))
+    entry = _named_file(_source_files(client, tizra_id, source), source, name)
+    return {
+        **entry,
+        "result": "created" if result["created"] else "replaced",
+        "note": CMS_NOTE,
+    }
+
+
+@mcp.tool(
+    description=f"""Save the content of a file in one of an object's sources to a local path.
+
+destination must be absolute. An existing file there is replaced only with overwrite; a failed
+download leaves the destination as it was. The content is written to disk, never returned.
+Returns the path, size and content-type.
+
+{SOURCES_GUIDE}"""
+)
+def download_file(
+    client: TizraApi,
+    tizra_id: str,
+    source: str,
+    name: str,
+    destination: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    dest = _absolute(destination)
+    if dest.is_dir():
+        raise ToolError(f"{destination} is a directory; give the path of the file to write.")
+    if dest.exists() and not overwrite:
+        raise ToolError(f"{destination} already exists; set overwrite to replace it.")
+    if not dest.parent.is_dir():
+        raise ToolError(f"{dest.parent} is not a directory.")
+    _named_file(_source_files(client, tizra_id, source), source, name)
+    fd, tmp_name = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".part")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            result = _api(client, lambda: client.download_file(tizra_id, source, name, out))
+        if "external" in result:
+            return {
+                "written": False,
+                "message": f"{name} in {source} is stored at an external URL; nothing was written.",
+                "url": result["external"],
+            }
+        if overwrite:
+            os.replace(tmp, dest)
+        else:
+            # Linking fails if the destination appeared during the download, where a rename
+            # would replace it; the temporary file is beside it, so on the same filesystem.
+            try:
+                os.link(tmp, dest)
+            except FileExistsError as e:
+                raise ToolError(
+                    f"{destination} was created while downloading; set overwrite to replace it."
+                ) from e
+    finally:
+        tmp.unlink(missing_ok=True)
+    return {"path": str(dest), "size": result["size"], "content-type": result["content-type"]}
+
+
+@mcp.tool(
+    description=f"""Change the settings of a file in one of an object's sources: rename it,
+or set its content_type, sort_field or props (string values; props not named are unchanged).
+The file's content is not changed; upload_file replaces content.
+
+Renaming a file in PropSource separates it from the property it is named for. In PdfSource,
+an update makes the site re-read the file, which can reset the object's bookmarks.
+
+{CMS_NOTE}
+
+{SOURCES_GUIDE}"""
+)
+def update_file(
+    client: TizraApi,
+    tizra_id: str,
+    source: str,
+    name: str,
+    new_name: str | None = None,
+    content_type: str | None = None,
+    sort_field: str | None = None,
+    props: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    changes = {
+        key: value
+        for key, value in (
+            ("name", new_name),
+            ("content-type", content_type),
+            ("sort-field", sort_field),
+            ("props", props),
+        )
+        if value is not None
+    }
+    if not changes:
+        raise ToolError("Nothing to change: give new_name, content_type, sort_field or props.")
+    _named_file(_source_files(client, tizra_id, source), source, name)
+    _api(client, lambda: client.update_file(tizra_id, source, name, changes))
+    entry = _named_file(_source_files(client, tizra_id, source), source, new_name or name)
+    return {**entry, "note": CMS_NOTE}
+
+
+class FileDeleteConfirmation(BaseModel):
+    confirm: bool = Field(description="Delete this file")
+
+
+@dataclass
+class FileToDelete:
+    obj: dict[str, Any]
+    source: str
+    name: str
+
+
+def find_file_to_delete(client: TizraApi, tizra_id: str, source: str, name: str) -> FileToDelete:
+    """The object and file delete_file would delete; a ToolError when the name is not exact."""
+    _named_file(_source_files(client, tizra_id, source), source, name)
+    obj = _api(client, lambda: client.get_object(tizra_id))
+    return FileToDelete(obj, source, name)
+
+
+def ask_file_delete(
+    target: Annotated[FileToDelete, Resolve(find_file_to_delete)],
+    client: TizraApi,
+    ctx: Context,
+) -> Elicit[BaseModel] | None:
+    """Ask the user to confirm deleting the file, naming it and its object."""
+    if not _can_elicit(ctx):
+        return None
+    obj = target.obj
+    object_name = _object_name(obj, _name_props(client, [obj]))
+    return Elicit(
+        f"Delete '{target.name}' from {target.source} of '{object_name}' ({_object_where(obj)})?",
+        FileDeleteConfirmation,
+    )
+
+
+@mcp.tool(
+    description=f"""Delete one file from one of an object's sources, after the user confirms.
+
+name must be the file's exact name; a position or a near match is refused, with the source's
+file names. The user is asked to confirm, naming the file and its object; there is no way to
+confirm on the user's behalf.
+
+{CMS_NOTE}
+
+{SOURCES_GUIDE}"""
+)
+def delete_file(
+    client: TizraApi,
+    target: Annotated[FileToDelete, Resolve(find_file_to_delete)],
+    confirmation: Annotated[
+        AcceptedElicitation[BaseModel] | DeclinedElicitation | CancelledElicitation | None,
+        Resolve(ask_file_delete),
+    ],
+    tizra_id: str,
+    source: str,
+    name: str,
+) -> str:
+    accepted = isinstance(confirmation, AcceptedElicitation)
+    # A resolver that returns None instead of asking arrives as accepted with no data.
+    if confirmation is None or (accepted and confirmation.data is None):
+        raise ToolError(
+            "Not deleted: deleting a file needs the user's confirmation, and this client cannot "
+            "ask for it (MCP elicitation)."
+        )
+    if not accepted or not confirmation.data.confirm:
+        return f"Deletion of {name} from {source} cancelled by the user; nothing was deleted."
+    canonical = target.obj["tizra-id"]
+    _api(client, lambda: client.delete_file(canonical, source, name))
+    return f"Deleted {name} from {source} of {canonical}. {CMS_NOTE}"
+
+
 @mcp.tool(
     description=f"""Search site content in the CMS state, so unpublished objects are included.
 
@@ -1033,9 +1375,18 @@ class _BatchClient:
         self._client = client
 
     def __getattribute__(self, name: str) -> Any:
-        if name == "delete_object" or name.startswith("_"):
-            raise AttributeError(f"{name} is not available in execute_code; use delete_object")
+        if name in _CONFIRMED_DELETES:
+            raise AttributeError(
+                f"{name} is not available in execute_code; use the {name} tool, which asks the "
+                "user to confirm"
+            )
+        if name.startswith("_"):
+            raise AttributeError(f"{name} is not available in execute_code")
         return getattr(object.__getattribute__(self, "_client"), name)
+
+
+_CONFIRMED_DELETES = frozenset({"delete_object", "delete_file"})
+"""Client methods that delete, each of which only its tool may call, after the user confirms."""
 
 
 def _jsonable(value: Any) -> Any:
