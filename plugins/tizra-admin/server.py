@@ -1192,6 +1192,8 @@ def update_file(
     }
     if not changes:
         raise ToolError("Nothing to change: give new_name, content_type, sort_field or props.")
+    if new_name is not None and not new_name.strip():
+        raise ToolError("Not changed: new_name must not be blank.")
     _named_file(_source_files(client, tizra_id, source), source, name)
     _api(client, lambda: client.update_file(tizra_id, source, name, changes))
     entry = _named_file(_source_files(client, tizra_id, source), source, new_name or name)

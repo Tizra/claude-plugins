@@ -30,6 +30,14 @@ ADMIN_MAIN = "/admin/main"
 
 MAX_ADMIN_HOPS = 5
 
+EXACT_NAME = {"exact-name": "true"}
+"""Asks a source-file GET or POST for the file of exactly the name given, never one by position.
+
+Without it the server takes a number that names no file as a position, so a file named 0 that
+vanishes after the tool checked its name would leave the request acting on another file. A
+server that predates the parameter ignores it.
+"""
+
 KEYWORD_COLON = "\u02d0"
 """Stands for a colon inside a search term's value, where a colon would separate its parts."""
 
@@ -279,7 +287,7 @@ class TizraClient:
         """
         path = self.admin_path("objects", tizra_id, source, name)
         try:
-            with self._http.stream("GET", path) as response:
+            with self._http.stream("GET", path, params=EXACT_NAME) as response:
                 if external := _external_location(response):
                     return {"external": external}
                 if response.is_redirect or response.is_error:
@@ -296,7 +304,9 @@ class TizraClient:
     def update_file(self, tizra_id: str, source: str, name: str, changes: dict[str, Any]) -> Any:
         """Apply `changes` (name, content-type, sort-field, props) to a file's settings."""
         path = self.admin_path("objects", tizra_id, source, name)
-        return self._request("POST", path, json={"operation": "update", **changes})
+        return self._request(
+            "POST", path, params=EXACT_NAME, json={"operation": "update", **changes}
+        )
 
     def delete_file(self, tizra_id: str, source: str, name: str) -> Any:
         return self._request("DELETE", self.admin_path("objects", tizra_id, source, name))
